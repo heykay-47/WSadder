@@ -312,16 +312,31 @@ function saveConfig() {
 }
 
 let client = null;
+let sessionLoss = null;
+
+function throwIfSessionLost() {
+  if (sessionLoss) throw sessionLoss;
+}
+
+class StartupAuth extends LocalAuth {
+  async afterBrowserInitialized() {
+    await super.afterBrowserInitialized();
+    this.client.pupPage.on('requestfailed', (request) => {
+      if (request.failure()?.errorText === 'net::ERR_NETWORK_CHANGED') {
+        this.networkChanged = true;
+      }
+    });
+  }
+}
 
 function createClient() {
   return new Client({
-    authStrategy: new LocalAuth(),
+    authStrategy: new StartupAuth(),
     takeoverOnConflict: true,
-    puppeteer: { headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html',
-    },
+    // Fail a hung page load after 60s (default 180s) so initClient can retry it.
+    puppeteer: { headless: true, protocolTimeout: 60000, args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+    // Use the live WhatsApp Web page; the archived HTML may be missing or stale.
+    webVersionCache: { type: 'none' },
   });
 }
 
@@ -414,7 +429,38 @@ function unusedRegisterClientEvents(instance) {
 }
 
 function registerClientEvents(instance) {
+  let authenticated = false;
+  const canProceed = () => instance === client && !alreadyProceeded;
+  const loseSession = (reason) => {
+    sessionLoss ??= new Error(`WhatsApp session lost (${reason}). Restart WSadder and log in again if prompted.`);
+  };
+
+  async function loadGroupsAndProceed(timeoutMs, options) {
+    if (!canProceed()) return;
+    let ownsWorkflow = false;
+    try {
+      const groups = await waitForGroups(timeoutMs, options, instance);
+      if (!canProceed()) return;
+      alreadyProceeded = true;
+      ownsWorkflow = true;
+      throwIfSessionLost();
+      await proceedWithGroups((groups || []).map(wrapGroup));
+    } catch (e) {
+      if (!ownsWorkflow && !canProceed()) return;
+      alreadyProceeded = true;
+      stopFullSyncProgress();
+      console.error(`\n${(sessionLoss || e).message}`);
+      await destroyClient(instance);
+      process.exit(1);
+    }
+  }
+
   instance.on('qr', (qr) => {
+    if (instance !== client || sessionLoss) return;
+    if (authenticated) {
+      loseSession('WhatsApp requested a new login');
+      return;
+    }
     console.log('\nOpen WhatsApp on your phone -> Settings -> Linked devices -> Link a device, then scan:\n');
     qrcode.generate(qr, { small: true });
   });
@@ -424,74 +470,82 @@ function registerClientEvents(instance) {
   });
 
   instance.on('auth_failure', (m) => console.error('Auth failure:', m));
-  instance.on('disconnected', (r) => console.log('Disconnected:', r));
+  instance.on('disconnected', (reason) => {
+    if (instance !== client) return;
+    console.log('Disconnected:', reason);
+    if (authenticated) loseSession(reason);
+  });
 
   instance.on('authenticated', async () => {
-    if (fastPathStarted || alreadyProceeded) return;
+    if (!canProceed()) return;
+    authenticated = true;
+    if (fastPathStarted) return;
     fastPathStarted = true;
 
     console.log('\nAuthenticated. Fetching groups directly from WhatsApp Web...');
 
-    try {
-      // Give the page a few seconds to initialise, then poll the in-page chat collections.
-      await sleep(8000);
-      if (alreadyProceeded) return;
-
-      const groups = await waitForGroups(180000, {
-        minWaitMs: 12000,
-        stableMs: 9000,
-      });
-      if (alreadyProceeded) return;
-
-      alreadyProceeded = true;
-      await proceedWithGroups((groups || []).map(wrapGroup));
-    } catch (e) {
-      if (alreadyProceeded) return;
-      stopFullSyncProgress();
-      console.error(`\nCould not load WhatsApp groups: ${e.message}`);
-      await destroyClient(instance);
-      process.exit(1);
-    }
+    await sleep(8000);
+    await loadGroupsAndProceed(180000, {
+      minWaitMs: 12000,
+      stableMs: 9000,
+    });
   });
 
   instance.on('ready', async () => {
-    if (alreadyProceeded) return;
+    if (!canProceed()) return;
+    authenticated = true;
     stopFullSyncProgress(true);
     console.log('\nWhatsApp Web fully synced.');
-    try {
-      const groups = await waitForGroups(30000, {
-        minWaitMs: 3000,
-        stableMs: 3000,
-      });
-      if (alreadyProceeded) return;
-      alreadyProceeded = true;
-      await proceedWithGroups((groups || []).map(wrapGroup));
-    } catch (e) {
-      if (alreadyProceeded) return;
-      stopFullSyncProgress();
-      console.error(`\nCould not load WhatsApp groups after ready: ${e.message}`);
-      await destroyClient(instance);
-      process.exit(1);
-    }
+    await loadGroupsAndProceed(30000, {
+      minWaitMs: 3000,
+      stableMs: 3000,
+    });
   });
 }
 
+function isAuthStartupTimeout(message) {
+  return /^auth timeout$|^Waiting failed: \d+ms exceeded$/i.test(message);
+}
+
 async function initClient(retries = 3) {
+  console.log('Starting WhatsApp Web (may retry if startup times out)...');
+  // Chrome aborts in-flight loads when any interface address changes (e.g. a
+  // flapping VPN adapter under WSL mirrored networking). These are transient,
+  // so allow extra quick retries for them without consuming the normal budget.
+  let networkChangedRetries = 10;
+  let sawNetworkChange = false;
   for (let i = 0; i < retries; i++) {
+    sessionLoss = null;
     client = createClient();
     registerClientEvents(client);
     try {
       await client.initialize();
       return;
     } catch (e) {
+      if (sessionLoss) return;
       const msg = e?.message || String(e);
+      const navigationInterrupted = /net::ERR_NETWORK_CHANGED/.test(msg);
+      sawNetworkChange ||= navigationInterrupted || !!client.authStrategy.networkChanged;
       stopFullSyncProgress();
-      await destroyClient(client);
+      const failedClient = client;
       client = null;
-      if (i < retries - 1 && /already running|destroyed|Target closed|Page closed/i.test(msg)) {
-        console.log(`\nPage closed during init, retrying (${i + 2}/${retries})...`);
+      fastPathStarted = false;
+      await destroyClient(failedClient);
+      if (navigationInterrupted && networkChangedRetries-- > 0) {
+        console.log('\nNetwork changed during load, retrying...');
+        i--;
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+      const retryable = isAuthStartupTimeout(msg)
+        || /already running|destroyed|Target closed|Page closed|timed out|net::ERR_/i.test(msg);
+      if (i < retries - 1 && retryable) {
+        console.log(`\nWhatsApp Web failed to load (${msg.split('\n')[0]}), retrying (${i + 2}/${retries})...`);
         await new Promise((r) => setTimeout(r, 3000));
         continue;
+      }
+      if (sawNetworkChange && (isAuthStartupTimeout(msg) || navigationInterrupted)) {
+        console.error('Chrome reported a network change while loading WhatsApp Web. Stabilize the network before retrying.');
       }
       throw e;
     }
@@ -674,7 +728,7 @@ function groupSignature(groups) {
     .join('|');
 }
 
-async function waitForGroups(timeoutMs, options = {}) {
+async function waitForGroups(timeoutMs, options = {}, instance = client) {
   const pollInterval = options.pollIntervalMs || 3000;
   const stableMs = options.stableMs ?? 6000;
   const minWaitMs = options.minWaitMs ?? 6000;
@@ -683,11 +737,12 @@ async function waitForGroups(timeoutMs, options = {}) {
   let bestGroups = [];
   let lastSignature = '';
   let stableSince = 0;
+  const canKeepPolling = () => instance === client && !alreadyProceeded && !sessionLoss;
 
-  while (Date.now() < deadline) {
+  while (canKeepPolling() && Date.now() < deadline) {
     try {
-      const result = normalizeGroupList(await client.pupPage.evaluate(extractFromStore));
-      if (result.length > 0) {
+      const result = normalizeGroupList(await instance.pupPage.evaluate(extractFromStore));
+      if (result.length > 0 && canKeepPolling()) {
         const signature = groupSignature(result);
         if (signature !== lastSignature) {
           lastSignature = signature;
@@ -702,6 +757,7 @@ async function waitForGroups(timeoutMs, options = {}) {
         }
       }
     } catch (_) {}
+    if (!canKeepPolling()) return null;
 
     const elapsed = Date.now() - startedAt;
     const pct = Math.min(99, Math.round((elapsed / timeoutMs) * 100));
@@ -709,6 +765,8 @@ async function waitForGroups(timeoutMs, options = {}) {
     process.stdout.write(`  syncing groups... ${pct}% (${Math.round(elapsed / 1000)}s/${Math.round(timeoutMs / 1000)}s${found})\r`);
     await sleep(pollInterval);
   }
+
+  if (!canKeepPolling()) return null;
 
   if (bestGroups.length > 0) {
     process.stdout.write(`  syncing groups... 100% - found ${bestGroups.length} groups\n`);
@@ -725,11 +783,15 @@ async function ensureWWebJS(timeoutMs = 30000) {
       return await client.pupPage.evaluate(() => typeof window.WWebJS !== 'undefined');
     } catch (_) {
       return false;
+    } finally {
+      throwIfSessionLost();
     }
   };
 
+  throwIfSessionLost();
   if (await hasWWebJS()) return;
 
+  throwIfSessionLost();
   try {
     await client.pupPage.evaluate(LoadUtils);
   } catch (_) {
@@ -738,10 +800,12 @@ async function ensureWWebJS(timeoutMs = 30000) {
 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    throwIfSessionLost();
     if (await hasWWebJS()) return;
     await sleep(500);
   }
 
+  throwIfSessionLost();
   throw new Error(`WhatsApp helper injection timed out after ${Math.round(timeoutMs / 1000)}s`);
 }
 
@@ -751,9 +815,12 @@ async function hydrateGroup(group) {
 
   try {
     await ensureWWebJS(30000);
+    throwIfSessionLost();
     const fullGroup = await withTimeout(client.getChatById(id), 30000, 'Loading selected group');
+    throwIfSessionLost();
     if (fullGroup?.isGroup) return fullGroup;
   } catch (e) {
+    throwIfSessionLost();
     console.warn(`Could not load full group details (${e.message}); using the loaded group summary.`);
   }
 
@@ -768,34 +835,44 @@ function wrapGroup(raw) {
     get participants() { return raw.participants || []; },
     addParticipants: async (ids) => {
       await ensureWWebJS(30000);
+      throwIfSessionLost();
       const fullGroup = await client.getChatById(raw.id._serialized);
+      throwIfSessionLost();
       return fullGroup.addParticipants(ids);
     },
-    getInviteCode: async () => {
-      try {
-        await ensureWWebJS(30000);
-        const fullGroup = await client.getChatById(raw.id._serialized);
-        if (fullGroup?.getInviteCode) return await fullGroup.getInviteCode();
-      } catch (_) {}
-
-      const codeRes = await client.pupPage.evaluate(async (chatId) => {
-        try {
-          return await window
-            .require('WAWebMexFetchGroupInviteCodeJob')
-            .fetchMexGroupInviteCode(chatId);
-        } catch (err) {
-          if (err.name === 'ServerStatusCodeError') return undefined;
-          throw err;
-        }
-      }, raw.id._serialized);
-      return codeRes?.code ? codeRes.code : codeRes;
-    },
   };
+}
+
+// whatsapp-web.js's GroupChat.getInviteCode() calls WAWebMexFetchGroupInviteCodeJob, but
+// WhatsApp Web now only loads that module lazily with the "Invite via link" drawer, so the
+// library call throws. Load the drawer's bundle first, then fetch the code.
+async function fetchInviteCode(groupId) {
+  await ensureWWebJS(30000);
+  throwIfSessionLost();
+  const codeRes = await client.pupPage.evaluate(async (chatId) => {
+    const MODULE = 'WAWebMexFetchGroupInviteCodeJob';
+    const loaded = () => Boolean(window.require('__debug')?.modulesMap?.[MODULE]);
+    if (!loaded()) {
+      await window.require('JSResourceForInteraction')('WAWebGroupInviteLinkDrawer.react').load();
+    }
+    try {
+      return await window.require(MODULE).fetchMexGroupInviteCode(chatId);
+    } catch (err) {
+      if (err.name === 'ServerStatusCodeError') return undefined;
+      throw err;
+    }
+  }, groupId);
+  const code = codeRes?.code ?? codeRes;
+  if (typeof code !== 'string' || !code.trim()) {
+    throw new Error('WhatsApp returned no invite code (are you an admin of this group?)');
+  }
+  return code.trim();
 }
 
 // ---------- processUser ----------
 
 async function processUser(u, group, inviteLink, existingIds, log, progress) {
+  throwIfSessionLost();
   const tag = progress ? `[${progress.n}/${progress.total}] ` : '';
   const waId = `${u.phone}@c.us`;
   const label = `${tag}${u.name || '(no name)'} <+${u.phone}>`;
@@ -811,8 +888,16 @@ async function processUser(u, group, inviteLink, existingIds, log, progress) {
     return 'dry-run';
   }
 
-  let registered = false;
-  try { registered = await client.isRegisteredUser(waId); } catch (_) {}
+  let registered;
+  try {
+    registered = await client.isRegisteredUser(waId);
+  } catch (e) {
+    throwIfSessionLost();
+    console.error(`! WhatsApp lookup failed for ${label}: ${e.message}`);
+    log?.failed.push({ ...u, error: `WhatsApp lookup failed: ${e.message}` });
+    return `failed: WhatsApp lookup failed (${e.message})`;
+  }
+  throwIfSessionLost();
   if (!registered) {
     console.log(`x not on WhatsApp: ${label}`);
     log?.notOnWhatsApp.push(u);
@@ -827,9 +912,11 @@ async function processUser(u, group, inviteLink, existingIds, log, progress) {
     statusCode = entry && (entry.code ?? entry.status);
     addedOk = statusCode === 200;
   } catch (e) {
+    throwIfSessionLost();
     console.error(`! error adding ${label}: ${e.message}`);
   }
 
+  throwIfSessionLost();
   if (addedOk) {
     console.log(`+ added: ${label}`);
     log?.added.push(u);
@@ -842,6 +929,11 @@ async function processUser(u, group, inviteLink, existingIds, log, progress) {
     existingIds.add(waId);
     return 'already in group';
   }
+  if (!inviteLink && cfg.inviteMessage.includes('{link}')) {
+    console.error(`! not added and no invite link to DM (code=${statusCode}): ${label}`);
+    log?.failed.push({ ...u, code: statusCode, error: 'no invite link' });
+    return statusCode ? `failed (add code=${statusCode}; no invite link to DM)` : 'failed: no invite link to DM';
+  }
   try {
     const msg = cfg.inviteMessage
       .replaceAll('{name}', u.name || '')
@@ -849,11 +941,14 @@ async function processUser(u, group, inviteLink, existingIds, log, progress) {
       .replaceAll('{eventName}', cfg.eventName || '')
       .replaceAll('{eventDate}', cfg.eventDate || '');
     await ensureWWebJS(30000);
+    throwIfSessionLost();
     await client.sendMessage(waId, msg);
+    throwIfSessionLost();
     console.log(`~ DM invited (couldn't add directly, code=${statusCode}): ${label}`);
     log?.invited.push(u);
     return statusCode ? `invited via DM (add code=${statusCode})` : 'invited via DM';
   } catch (e) {
+    throwIfSessionLost();
     console.error(`! DM invite failed for ${label}: ${e.message}`);
     log?.failed.push({ ...u, code: statusCode, error: e.message });
     return statusCode ? `failed (add code=${statusCode}; DM: ${e.message})` : `failed: ${e.message}`;
@@ -948,6 +1043,7 @@ async function proceedWithGroups(groups) {
   const needsPick = interactiveSession || !group;
   if (needsPick) {
     const picked = await pickAndSaveGroup(groups, group);
+    throwIfSessionLost();
     if (picked) group = picked;
     if (!group) {
       console.log('No selection — group config unchanged.');
@@ -960,21 +1056,28 @@ async function proceedWithGroups(groups) {
   let inviteLink = null;
   while (true) {
     group = await hydrateGroup(group);
+    throwIfSessionLost();
     console.log(`\nTarget group: ${group.name}  [${group.id._serialized}]`);
 
     inviteLink = null;
     try {
-      const code = await group.getInviteCode();
+      const code = await fetchInviteCode(group.id._serialized);
+      throwIfSessionLost();
       inviteLink = `https://chat.whatsapp.com/${code}`;
       console.log(`Invite link: ${inviteLink}`);
     } catch (e) {
-    console.warn('Could not fetch invite link — make sure you are an admin of this group.');
-  }
+      throwIfSessionLost();
+      console.warn(`Could not fetch invite link (${e.message}).`);
+      if (cfg.inviteMessage?.includes('{link}')) {
+        console.warn('People who cannot be added directly will NOT be DMed, because the message would have no link.');
+      }
+    }
 
     // After interactive pick (--setup / --list-groups), ask what to do next.
     if (!interactiveSession) break;
 
     action = await chooseNextAction();
+    throwIfSessionLost();
     if (action === 'exit') {
       console.log('Exiting. Run `npm start` later when you are ready.');
       await client.destroy();
@@ -1010,7 +1113,9 @@ async function proceedWithGroups(groups) {
   if (action === 'test') {
     console.log('\n=== Test mode (single recipient) ===');
     const tName = (await prompt('Test user name (Enter to skip): ')).trim();
+    throwIfSessionLost();
     const tPhoneRaw = await promptRequired('Test phone number (e.g. 0123456789, +60-1162383838, or +1 (415) 555-0101)', '');
+    throwIfSessionLost();
     const tPhone = normalizePhoneForWhatsApp(tPhoneRaw, cfg.defaultCountryCode);
     if (!tPhone) {
       console.error('Could not parse the phone number.');
@@ -1019,6 +1124,7 @@ async function proceedWithGroups(groups) {
     }
     console.log('');
     await processUser({ name: tName, phone: tPhone }, group, inviteLink, existingIds, null);
+    throwIfSessionLost();
     console.log('\nTest complete. Re-run with `npm start` to add everyone from the Excel.');
     await client.destroy();
     process.exit(0);
@@ -1037,13 +1143,20 @@ async function proceedWithGroups(groups) {
   const startedAt = Date.now();
 
   for (let i = 0; i < total; i++) {
-    const status = await processUser(users[i], group, inviteLink, existingIds, log, { n: i + 1, total });
+    if (sessionLoss) break;
+    let status;
+    try {
+      status = await processUser(users[i], group, inviteLink, existingIds, log, { n: i + 1, total });
+    } catch (e) {
+      if (e !== sessionLoss) throw e;
+      break;
+    }
     setExcelStatus(run, users[i].rowIndex, status || 'unknown');
     saveExcelRun(run);
     const done = i + 1;
     const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
     console.log(`   progress: added=${log.added.length} invited=${log.invited.length} skipped=${log.skipped.length} not-on-wa=${log.notOnWhatsApp.length} failed=${log.failed.length}  (${done}/${total}, ${elapsedSec}s elapsed)`);
-    if (i < total - 1) {
+    if (!sessionLoss && i < total - 1) {
       await new Promise((r) => setTimeout(r, cfg.delayMsBetweenAdds || 1500));
     }
   }
@@ -1058,6 +1171,7 @@ async function proceedWithGroups(groups) {
   console.log('Detailed log: add_log.json');
   console.log(`Excel updated:   ${cfg.excelFile} (${STATUS_COLUMN})`);
 
+  throwIfSessionLost();
   await client.destroy();
   process.exit(0);
 }
@@ -1149,5 +1263,9 @@ async function main() {
 
 main().catch((err) => {
   console.error(err);
+  if (isAuthStartupTimeout(err?.message || String(err))) {
+    console.error('\nWhatsApp Web did not finish starting. Your saved login was not reset.'
+      + '\nCheck that https://web.whatsapp.com/ opens in your browser. A startup timeout alone is not a reason to reset your saved login.');
+  }
   process.exit(1);
 });

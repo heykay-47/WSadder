@@ -22,7 +22,7 @@ The tool also includes a smart fallback mechanism: if a participant cannot be ad
 
 WSadder is especially useful for workshops, training sessions, classes, volunteer programs, community events, and other organized activities where many confirmed participants need to be added to the correct WhatsApp group quickly and reliably.
 
-This repository includes `sample-participants.xlsx` with fake participant data. Replace it with your own Excel file before running against real contacts.
+Use your own Excel file for the participant list.
 
 ## Features
 
@@ -128,7 +128,7 @@ npm install whatsapp-web.js qrcode-terminal xlsx
 
 ## Setup
 
-1. Put your Excel `.xlsx` file in the project folder, or use the included `sample-participants.xlsx` for testing.
+1. Put your Excel `.xlsx` file in the project folder. Use fake participant data for testing.
 2. Run the setup wizard:
 
 ```bash
@@ -145,7 +145,7 @@ npm run setup
 
 The setup saves your choices in `config.json`.
 
-By default, `config.json` has `"dryRun": true` so the sample project does not add or message anyone accidentally. Set it to `false` only when your real Excel file, WhatsApp group, and message are ready.
+By default, `config.json` has `"dryRun": true` so the app does not add or message anyone accidentally. Set it to `false` only when your real Excel file, WhatsApp group, and message are ready.
 
 ## Safety Checklist
 
@@ -263,6 +263,8 @@ add_log.json
 | Issue | What to check |
 | --- | --- |
 | QR code does not work | Make sure WhatsApp Web is reachable and scan with the correct WhatsApp account |
+| WhatsApp disconnects during a batch | The batch stops and saves its completed results. The interrupted row is left unchanged, so check whether its add or invite went through before retrying it. Restart WSadder and scan the startup QR if prompted. |
+| `auth timeout` or `Waiting failed` during startup | Run `npm install` so `patches/whatsapp-web.js+1.34.8.patch` is applied: it makes the QR login work with WhatsApp Web's new `/login/` page. If Chrome also reports a network change, stabilize the connection before retrying. A timeout alone does not mean the saved login is broken. |
 | Group is not listed | Wait for WhatsApp Web sync, then run `npm run list-groups` again |
 | Invite link cannot be fetched | Make sure your WhatsApp account has permission to access or generate the group invite link |
 | Participants are skipped | Check the selected phone column and phone number format |

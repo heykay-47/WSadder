@@ -1,0 +1,149 @@
+diff --git a/node_modules/whatsapp-web.js/src/Client.js b/node_modules/whatsapp-web.js/src/Client.js
+index 62de539..6778272 100644
+--- a/node_modules/whatsapp-web.js/src/Client.js
++++ b/node_modules/whatsapp-web.js/src/Client.js
+@@ -136,10 +136,16 @@ class Client extends EventEmitter {
+             const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
+             const version = await this.getWWebVersion();
+ 
+-            const needAuthHandle = await this.pupPage.waitForFunction(
+-                () => {
++            // WhatsApp Web replaces the page's timers while it boots, which stalls
++            // Puppeteer's in-page polling (waitForFunction); poll from Node instead.
++            const readAuthState = () =>
++                this.pupPage.evaluate(() => {
++                    // Logged-out sessions now land on /login/, which has no
++                    // WAWebSocketModel; WAWebBackendEventBus has the same state there.
+                     const state =
+-                        window.require?.('WAWebSocketModel')?.Socket?.state;
++                        window.require?.('WAWebSocketModel')?.Socket?.state ??
++                        window.require?.('WAWebBackendEventBus')
++                            ?.BackendEventBus?.socketState;
+                     if (
+                         !state ||
+                         state === 'OPENING' ||
+@@ -152,10 +158,17 @@ class Client extends EventEmitter {
+                         need: state === 'UNPAIRED' || state === 'UNPAIRED_IDLE',
+                         state,
+                     };
+-                },
+-                { timeout: authTimeout },
+-            );
+-            const needAuthentication = await needAuthHandle.jsonValue();
++                });
++            const authDeadline = Date.now() + authTimeout;
++            let needAuthentication;
++            // A navigation (e.g. the redirect to /login/) destroys the context; retry.
++            while (!(needAuthentication = await readAuthState().catch(() => false))) {
++                if (abort.signal.aborted) return;
++                if (Date.now() > authDeadline) {
++                    throw new Error(`Waiting failed: ${authTimeout}ms exceeded`);
++                }
++                await new Promise((resolve) => setTimeout(resolve, 250));
++            }
+ 
+             if (needAuthentication.need) {
+                 const { failed, failureEventPayload, restart } =
+@@ -259,13 +272,25 @@ class Client extends EventEmitter {
+                             .Conn.on('change:ref', onRefChange); // future QR changes
+ 
+                         // Remove QR listener once authentication succeeds
+-                        window
+-                            .require('WAWebSocketModel')
+-                            .Socket.on('change:hasSynced', () => {
+-                                window
+-                                    .require('WAWebConnModel')
+-                                    .Conn.off('change:ref', onRefChange);
+-                            });
++                        const removeQrListener = () => {
++                            window
++                                .require('WAWebConnModel')
++                                .Conn.off('change:ref', onRefChange);
++                        };
++                        const socketModel = window.require('WAWebSocketModel');
++                        if (socketModel) {
++                            socketModel.Socket.on(
++                                'change:hasSynced',
++                                removeQrListener,
++                            );
++                        } else {
++                            window
++                                .require('WAWebBackendEventBus')
++                                .BackendEventBus.on(
++                                    'open_socket_stream',
++                                    removeQrListener,
++                                );
++                        }
+                     });
+                 }
+             }
+@@ -388,24 +413,54 @@ class Client extends EventEmitter {
+                 },
+             );
+             await this.pupPage.evaluate(() => {
+-                const Socket = window.require('WAWebSocketModel').Socket;
++                const socketModel = window.require('WAWebSocketModel');
+                 const Cmd = window.require('WAWebCmd').Cmd;
++                let Socket;
++                let socketListeners;
++                if (socketModel) {
++                    Socket = socketModel.Socket;
++                    socketListeners = [
++                        [
++                            Socket,
++                            'change:state',
++                            (_AppState, state) => {
++                                window.onAuthAppStateChangedEvent(state);
++                            },
++                        ],
++                        [
++                            Socket,
++                            'change:hasSynced',
++                            () => {
++                                window.onAppStateHasSyncedEvent();
++                            },
++                        ],
++                    ];
++                } else {
++                    // /login/ route: no WAWebSocketModel, use the backend event bus.
++                    const Bus = window.require(
++                        'WAWebBackendEventBus',
++                    ).BackendEventBus;
++                    Socket = { hasSynced: Bus.isMainStreamReadyMd === true };
++                    socketListeners = [
++                        [
++                            Bus,
++                            'set_socket_state',
++                            (state) => {
++                                window.onAuthAppStateChangedEvent(state);
++                            },
++                        ],
++                        [
++                            Bus,
++                            'open_socket_stream',
++                            () => {
++                                window.onAppStateHasSyncedEvent();
++                            },
++                        ],
++                    ];
++                }
+ 
+                 const listeners = [
+-                    [
+-                        Socket,
+-                        'change:state',
+-                        (_AppState, state) => {
+-                            window.onAuthAppStateChangedEvent(state);
+-                        },
+-                    ],
+-                    [
+-                        Socket,
+-                        'change:hasSynced',
+-                        () => {
+-                            window.onAppStateHasSyncedEvent();
+-                        },
+-                    ],
++                    ...socketListeners,
+                     [
+                         Cmd,
+                         'offline_progress_update_from_bridge',

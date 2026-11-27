@@ -1,5 +1,5 @@
 {
-  "excelFile": "sample-participants.xlsx",
+  "excelFile": "",
   "phoneColumn": "Phone Number (WhatsApp Avalible)",
   "nameColumn": "Full name as per IC/Passport",
   "defaultCountryCode": "60",
